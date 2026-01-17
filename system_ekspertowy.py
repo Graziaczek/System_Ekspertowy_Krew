@@ -1,13 +1,11 @@
 import pandas as pd
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import apriori, association_rules as arules
 
 # -----------------------------
 # Funkcja do przygotowania progów dla wszystkich parametrów
 # -----------------------------
 def compute_thresholds(data, parameters):
-    """
-    Oblicza kwartyle i progi outlierów dla wszystkich parametrów.
-    Zwraca słownik: param -> {Q1, Q2, Q3, lower_bound, upper_bound}
-    """
     thresholds = {}
     for param in parameters:
         series = data[param]
@@ -27,24 +25,16 @@ def compute_thresholds(data, parameters):
     return thresholds
 
 # -----------------------------
-# Funkcja do dyskretyzacji jednej próbki
+# Funkcja do dyskretyzacji jednej próbki (zwraca słownik parametr->poziom)
 # -----------------------------
 def discretize_sample(sample, thresholds):
-    """
-    sample: pd.Series z wartościami parametrów jednej próbki
-    thresholds: wynik compute_thresholds()
-    
-    Zwraca listę faktów w formie ["Parametr jest niski", ...]
-    """
-    facts = []
-    
+    discretized = {}
     for param, bounds in thresholds.items():
         value = sample[param]
         Q1 = bounds["Q1"]
         Q2 = bounds["Q2"]
         Q3 = bounds["Q3"]
-        
-        # klasyfikacja kwartylowa
+
         if value < Q1:
             level = "niski"
         elif value < Q2:
@@ -53,24 +43,58 @@ def discretize_sample(sample, thresholds):
             level = "średni-górny"
         else:
             level = "wysoki"
-        
-        facts.append(f"{param} jest {level}")
-        
-        # opcjonalnie: oznaczanie outlierów
+
+        # opcjonalnie oznaczenie outlierów
         if value < bounds["lower_bound"]:
-            facts.append(f"{param} jest ekstremalnie niski")
-        if value > bounds["upper_bound"]:
-            facts.append(f"{param} jest ekstremalnie wysoki")
-    
-    return facts
+            level = "ekstremalnie niski"
+        elif value > bounds["upper_bound"]:
+            level = "ekstremalnie wysoki"
+
+        discretized[param] = level
+
+    # dodajemy chorobę jako ostatnią kolumnę
+    discretized["Disease"] = sample["Disease"]
+    return discretized
+
+# -----------------------------
+# Funkcja do dyskretyzacji całego zbioru
+# -----------------------------
+def discretize_dataset(data, thresholds):
+    discretized_rows = []
+    for _, sample in data.iterrows():
+        discretized_rows.append(discretize_sample(sample, thresholds))
+    return pd.DataFrame(discretized_rows)
+
+# -----------------------------
+# Funkcja do generowania reguł asocjacyjnych
+# -----------------------------
+def generate_association_rules(discret_dataset, min_support=0.05, min_confidence=0.7):
+    # tworzymy listę transakcji (każdy wiersz jako lista faktów Parametr=Poziom)
+    transactions = []
+    for _, row in discret_dataset.iterrows():
+        facts = [f"{col}={row[col]}" for col in discret_dataset.columns if pd.notna(row[col])]
+        transactions.append(facts)
+
+    # konwersja do formatu one-hot
+    te = TransactionEncoder()
+    te_ary = te.fit(transactions).transform(transactions)
+    df = pd.DataFrame(te_ary, columns=te.columns_)
+
+    # Apriori
+    frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
+    rules = arules(frequent_itemsets, metric="confidence", min_threshold=min_confidence)
+
+    # filtrowanie reguł prowadzących do choroby
+    disease_rules = rules[rules['consequents'].apply(lambda x: any('Disease=' in item for item in x))]
+    disease_rules = disease_rules.sort_values(by='confidence', ascending=False)
+    return disease_rules
 
 # -----------------------------
 # PRZYKŁAD UŻYCIA
 # -----------------------------
 if __name__ == "__main__":
-    # wczytanie danych do wyznaczenia progów
     data = pd.read_csv("Blood_samples.csv")
-    
+
     parameters = [
         "Glucose","Cholesterol","Hemoglobin","Platelets","White Blood Cells","Red Blood Cells",
         "Hematocrit","Mean Corpuscular Volume","Mean Corpuscular Hemoglobin",
@@ -78,14 +102,14 @@ if __name__ == "__main__":
         "Diastolic Blood Pressure","Triglycerides","HbA1c","LDL Cholesterol","HDL Cholesterol",
         "ALT","AST","Heart Rate","Creatinine","Troponin","C-reactive Protein"
     ]
-    
+
     # obliczamy progi
     thresholds = compute_thresholds(data, parameters)
-    
-    # wybieramy jedną próbkę do dyskretyzacji
-    sample = data.iloc[0]
-    
-    # generujemy fakty
-    facts = discretize_sample(sample, thresholds)
-    for f in facts:
-        print(f)
+
+    # dyskretyzujemy cały zbiór danych
+    discret_dataset = discretize_dataset(data, thresholds)
+    print(discret_dataset.head())
+
+    # generujemy reguły asocjacyjne
+    rules = generate_association_rules(discret_dataset)
+    pd.DataFrame(rules).to_csv("association_rules.csv", index=False)
