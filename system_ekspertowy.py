@@ -6,6 +6,10 @@ from mlxtend.frequent_patterns import apriori, association_rules as arules
 # Funkcja do przygotowania progów dla wszystkich parametrów
 # -----------------------------
 def compute_thresholds(data, parameters):
+    """
+    Oblicza kwartyle i progi ekstremalne dla wszystkich parametrów.
+    Zwraca słownik thresholds[param] = {"Q1", "Q2", "Q3", "lower_bound", "upper_bound"}
+    """
     thresholds = {}
     for param in parameters:
         series = data[param]
@@ -25,16 +29,18 @@ def compute_thresholds(data, parameters):
     return thresholds
 
 # -----------------------------
-# Funkcja do dyskretyzacji jednej próbki (zwraca słownik parametr->poziom)
+# Funkcja do dyskretyzacji jednej próbki
 # -----------------------------
 def discretize_sample(sample, thresholds):
+    """
+    Zwraca słownik: {parametr: poziom}
+    """
     discretized = {}
     for param, bounds in thresholds.items():
         value = sample[param]
-        Q1 = bounds["Q1"]
-        Q2 = bounds["Q2"]
-        Q3 = bounds["Q3"]
+        Q1, Q2, Q3 = bounds["Q1"], bounds["Q2"], bounds["Q3"]
 
+        # klasyfikacja kwartylowa
         if value < Q1:
             level = "niski"
         elif value < Q2:
@@ -44,7 +50,7 @@ def discretize_sample(sample, thresholds):
         else:
             level = "wysoki"
 
-        # opcjonalnie oznaczenie outlierów
+        # oznaczenie outlierów
         if value < bounds["lower_bound"]:
             level = "ekstremalnie niski"
         elif value > bounds["upper_bound"]:
@@ -52,42 +58,111 @@ def discretize_sample(sample, thresholds):
 
         discretized[param] = level
 
-    # dodajemy chorobę jako ostatnią kolumnę
+    # dodajemy chorobę
     discretized["Disease"] = sample["Disease"]
     return discretized
 
 # -----------------------------
-# Funkcja do dyskretyzacji całego zbioru
+# Dyskretyzacja całego zbioru danych
 # -----------------------------
 def discretize_dataset(data, thresholds):
-    discretized_rows = []
-    for _, sample in data.iterrows():
-        discretized_rows.append(discretize_sample(sample, thresholds))
-    return pd.DataFrame(discretized_rows)
+    return pd.DataFrame([discretize_sample(row, thresholds) for _, row in data.iterrows()])
 
-# -----------------------------
-# Funkcja do generowania reguł asocjacyjnych
-# -----------------------------
 def generate_association_rules(discret_dataset, min_support=0.05, min_confidence=0.7):
-    # tworzymy listę transakcji (każdy wiersz jako lista faktów Parametr=Poziom)
+    """
+    Generuje reguły asocjacyjne, w których:
+    - Disease NIE występuje w antecedents
+    - Disease WYSTĘPUJE w consequents
+    """
+
     transactions = []
     for _, row in discret_dataset.iterrows():
+        # ❗ choroba trafia do transakcji, ale będzie kontrolowana później
         facts = [f"{col}={row[col]}" for col in discret_dataset.columns if pd.notna(row[col])]
         transactions.append(facts)
 
-    # konwersja do formatu one-hot
     te = TransactionEncoder()
     te_ary = te.fit(transactions).transform(transactions)
     df = pd.DataFrame(te_ary, columns=te.columns_)
 
-    # Apriori
     frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
     rules = arules(frequent_itemsets, metric="confidence", min_threshold=min_confidence)
 
-    # filtrowanie reguł prowadzących do choroby
-    disease_rules = rules[rules['consequents'].apply(lambda x: any('Disease=' in item for item in x))]
-    disease_rules = disease_rules.sort_values(by='confidence', ascending=False)
-    return disease_rules
+    # ✅ Disease tylko w consequents
+    rules = rules[
+        rules['consequents'].apply(lambda x: any(i.startswith('Disease=') for i in x)) &
+        rules['antecedents'].apply(lambda x: not any(i.startswith('Disease=') for i in x))
+    ]
+
+    rules = rules.sort_values(by='confidence', ascending=False)
+    return rules
+
+
+# -----------------------------
+# Konwersja reguł do formatu eksperckiego (tylko choroby w consequents)
+# -----------------------------
+def rules_to_expert_format(rules_df, top_n=None):
+    """
+    Zwraca listę słowników:
+    {"antecedents": {...}, "consequents": {...}, "confidence": ...}
+
+    W polu consequents będą tylko choroby (parametr 'Disease').
+    """
+    rules_df = rules_df.sort_values(by='confidence', ascending=False)
+    if top_n is not None:
+        rules_df = rules_df.head(top_n)
+
+    expert_rules = []
+    for _, row in rules_df.iterrows():
+        # Antecedents: wszystkie cechy oprócz Disease
+        antecedents = {item.split('=')[0]: item.split('=')[1] 
+                       for item in row['antecedents'] 
+                       if not item.startswith("Disease=")}
+
+        # Consequents: tylko choroba
+        consequents = {item.split('=')[0]: item.split('=')[1] 
+                       for item in row['consequents'] 
+                       if item.startswith("Disease=")}
+
+        # jeśli consequents jest puste, pomijamy regułę
+        if not consequents:
+            continue
+
+        confidence = row['confidence']
+        expert_rules.append({
+            "antecedents": antecedents,
+            "consequents": consequents,
+            "confidence": confidence
+        })
+
+    return expert_rules
+
+
+# -----------------------------
+# Wnioskowanie dla jednej próbki
+# -----------------------------
+def apply_rules(discretized_sample, expert_rules, min_confidence=0.0):
+    """
+    Zwraca listę pasujących reguł w formie słowników:
+    {"consequents": {...}, "confidence": ...}
+    """
+    inferred = []
+    for rule in expert_rules:
+        if rule['confidence'] < min_confidence:
+            continue
+        # Sprawdzenie, czy wszystkie antecedents pasują do próbki
+        match = all(discretized_sample.get(param) == value
+                    for param, value in rule['antecedents'].items())
+        if match:
+            inferred.append({
+                "consequents": rule['consequents'],
+                "confidence": rule['confidence']
+            })
+
+    # sortowanie po confidence malejąco
+    inferred.sort(key=lambda x: x['confidence'], reverse=True)
+    return inferred[0]['consequents']['Disease']  # np. 5 najbardziej pewnych reguł
+
 
 # -----------------------------
 # PRZYKŁAD UŻYCIA
@@ -103,13 +178,42 @@ if __name__ == "__main__":
         "ALT","AST","Heart Rate","Creatinine","Troponin","C-reactive Protein"
     ]
 
-    # obliczamy progi
+    # 1️⃣ przygotowanie systemu
     thresholds = compute_thresholds(data, parameters)
-
-    # dyskretyzujemy cały zbiór danych
     discret_dataset = discretize_dataset(data, thresholds)
-    print(discret_dataset.head())
 
-    # generujemy reguły asocjacyjne
-    rules = generate_association_rules(discret_dataset)
-    pd.DataFrame(rules).to_csv("association_rules.csv", index=False)
+    rules_df = generate_association_rules(discret_dataset)
+    expert_rules = rules_to_expert_format(rules_df, top_n=800)
+
+    # 2️⃣ test skuteczności
+    correct = 0
+    total = 0
+    no_prediction = 0
+
+    for idx, row in data.iterrows():
+        true_disease = row["Disease"]
+
+        sample_disc = discretize_sample(row, thresholds)
+        sample_disc.pop("Disease")  # ❗ ukrywamy prawdziwą chorobę
+
+        predicted = apply_rules(sample_disc, expert_rules, min_confidence=0.7)
+
+
+        if predicted is None:
+            no_prediction += 1
+            continue
+
+        if predicted == true_disease:
+            correct += 1
+
+        total += 1
+
+    accuracy = correct / total if total > 0 else 0
+
+    print("=== WYNIKI TESTU ===")
+    print(f"Liczba próbek: {len(data)}")
+    print(f"Przewidziane: {total}")
+    print(f"Brak reguły: {no_prediction}")
+    print(f"Poprawne: {correct}")
+    print(f"Accuracy: {accuracy:.2%}")
+
