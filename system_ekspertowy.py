@@ -1,15 +1,17 @@
 import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
 from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import apriori, association_rules as arules
 
-# -----------------------------
-# Funkcja do przygotowania progów dla wszystkich parametrów
-# -----------------------------
+
+# =========================================================
+# 1. DYSKRETYZACJA – PROGI (LICZONE TYLKO NA TRAIN)
+# =========================================================
+
 def compute_thresholds(data, parameters):
-    """
-    Oblicza kwartyle i progi ekstremalne dla wszystkich parametrów.
-    Zwraca słownik thresholds[param] = {"Q1", "Q2", "Q3", "lower_bound", "upper_bound"}
-    """
     thresholds = {}
     for param in parameters:
         series = data[param]
@@ -17,203 +19,206 @@ def compute_thresholds(data, parameters):
         Q2 = series.quantile(0.50)
         Q3 = series.quantile(0.75)
         IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
         thresholds[param] = {
             "Q1": Q1,
             "Q2": Q2,
             "Q3": Q3,
-            "lower_bound": lower_bound,
-            "upper_bound": upper_bound
+            "lower": Q1 - 1.5 * IQR,
+            "upper": Q3 + 1.5 * IQR
         }
     return thresholds
 
-# -----------------------------
-# Funkcja do dyskretyzacji jednej próbki
-# -----------------------------
-def discretize_sample(sample, thresholds):
-    """
-    Zwraca słownik: {parametr: poziom}
-    """
-    discretized = {}
-    for param, bounds in thresholds.items():
-        value = sample[param]
-        Q1, Q2, Q3 = bounds["Q1"], bounds["Q2"], bounds["Q3"]
 
-        # klasyfikacja kwartylowa
-        if value < Q1:
+def discretize_sample(sample, thresholds):
+    discretized = {}
+    for param, t in thresholds.items():
+        v = sample[param]
+
+        if v < t["Q1"]:
             level = "niski"
-        elif value < Q2:
-            level = "średni-dolny"
-        elif value < Q3:
-            level = "średni-górny"
+        elif v < t["Q2"]:
+            level = "średni_dolny"
+        elif v < t["Q3"]:
+            level = "średni_górny"
         else:
             level = "wysoki"
 
-        # oznaczenie outlierów
-        if value < bounds["lower_bound"]:
-            level = "ekstremalnie niski"
-        elif value > bounds["upper_bound"]:
-            level = "ekstremalnie wysoki"
+        if v < t["lower"]:
+            level = "ekstremalnie_niski"
+        elif v > t["upper"]:
+            level = "ekstremalnie_wysoki"
 
         discretized[param] = level
 
-    # dodajemy chorobę
     discretized["Disease"] = sample["Disease"]
     return discretized
 
-# -----------------------------
-# Dyskretyzacja całego zbioru danych
-# -----------------------------
-def discretize_dataset(data, thresholds):
-    return pd.DataFrame([discretize_sample(row, thresholds) for _, row in data.iterrows()])
 
-def generate_association_rules(discret_dataset, min_support=0.05, min_confidence=0.7):
-    """
-    Generuje reguły asocjacyjne, w których:
-    - Disease NIE występuje w antecedents
-    - Disease WYSTĘPUJE w consequents
-    """
+def discretize_dataset(data, thresholds):
+    return pd.DataFrame(
+        [discretize_sample(row, thresholds) for _, row in data.iterrows()]
+    )
+
+
+# =========================================================
+# 2. SYSTEM REGUŁOWY – APRIORI
+# =========================================================
+
+def generate_association_rules(discret_dataset,
+                               min_support=0.05,
+                               min_confidence=0.7):
 
     transactions = []
     for _, row in discret_dataset.iterrows():
-        # ❗ choroba trafia do transakcji, ale będzie kontrolowana później
-        facts = [f"{col}={row[col]}" for col in discret_dataset.columns if pd.notna(row[col])]
-        transactions.append(facts)
+        transactions.append([f"{c}={row[c]}" for c in discret_dataset.columns])
 
     te = TransactionEncoder()
     te_ary = te.fit(transactions).transform(transactions)
-    df = pd.DataFrame(te_ary, columns=te.columns_)
+    df_bin = pd.DataFrame(te_ary, columns=te.columns_)
 
-    frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
-    rules = arules(frequent_itemsets, metric="confidence", min_threshold=min_confidence)
+    frequent = apriori(df_bin, min_support=min_support, use_colnames=True)
+    rules = arules(frequent, metric="confidence", min_threshold=min_confidence)
 
-    # ✅ Disease tylko w consequents
+    # Disease tylko w consequents
     rules = rules[
-        rules['consequents'].apply(lambda x: any(i.startswith('Disease=') for i in x)) &
-        rules['antecedents'].apply(lambda x: not any(i.startswith('Disease=') for i in x))
+        rules["consequents"].apply(lambda x: any(i.startswith("Disease=") for i in x)) &
+        rules["antecedents"].apply(lambda x: not any(i.startswith("Disease=") for i in x))
     ]
 
-    rules = rules.sort_values(by='confidence', ascending=False)
-    return rules
+    return rules.sort_values(by="confidence", ascending=False)
 
 
-# -----------------------------
-# Konwersja reguł do formatu eksperckiego (tylko choroby w consequents)
-# -----------------------------
-def rules_to_expert_format(rules_df, top_n=None):
-    """
-    Zwraca listę słowników:
-    {"antecedents": {...}, "consequents": {...}, "confidence": ...}
-
-    W polu consequents będą tylko choroby (parametr 'Disease').
-    """
-    rules_df = rules_df.sort_values(by='confidence', ascending=False)
-    if top_n is not None:
-        rules_df = rules_df.head(top_n)
-
+def rules_to_expert_format(rules_df, top_n=800):
     expert_rules = []
-    for _, row in rules_df.iterrows():
-        # Antecedents: wszystkie cechy oprócz Disease
-        antecedents = {item.split('=')[0]: item.split('=')[1] 
-                       for item in row['antecedents'] 
-                       if not item.startswith("Disease=")}
-
-        # Consequents: tylko choroba
-        consequents = {item.split('=')[0]: item.split('=')[1] 
-                       for item in row['consequents'] 
-                       if item.startswith("Disease=")}
-
-        # jeśli consequents jest puste, pomijamy regułę
-        if not consequents:
-            continue
-
-        confidence = row['confidence']
+    for _, row in rules_df.head(top_n).iterrows():
+        antecedents = {
+            i.split("=")[0]: i.split("=")[1]
+            for i in row["antecedents"]
+        }
+        consequents = {
+            i.split("=")[0]: i.split("=")[1]
+            for i in row["consequents"]
+        }
         expert_rules.append({
             "antecedents": antecedents,
             "consequents": consequents,
-            "confidence": confidence
+            "confidence": row["confidence"]
         })
-
     return expert_rules
 
 
-# -----------------------------
-# Wnioskowanie dla jednej próbki
-# -----------------------------
-def apply_rules(discretized_sample, expert_rules, min_confidence=0.0):
-    """
-    Zwraca listę pasujących reguł w formie słowników:
-    {"consequents": {...}, "confidence": ...}
-    """
-    inferred = []
+def apply_rules(discretized_sample, expert_rules, min_confidence=0.7):
+    matches = []
     for rule in expert_rules:
-        if rule['confidence'] < min_confidence:
+        if rule["confidence"] < min_confidence:
             continue
-        # Sprawdzenie, czy wszystkie antecedents pasują do próbki
-        match = all(discretized_sample.get(param) == value
-                    for param, value in rule['antecedents'].items())
-        if match:
-            inferred.append({
-                "consequents": rule['consequents'],
-                "confidence": rule['confidence']
-            })
+        if all(discretized_sample.get(k) == v
+               for k, v in rule["antecedents"].items()):
+            matches.append(rule)
 
-    # sortowanie po confidence malejąco
-    inferred.sort(key=lambda x: x['confidence'], reverse=True)
-    return inferred[0]['consequents']['Disease']  # np. 5 najbardziej pewnych reguł
+    if not matches:
+        return None
+
+    matches.sort(key=lambda x: x["confidence"], reverse=True)
+    return matches[0]["consequents"]["Disease"]
 
 
-# -----------------------------
-# PRZYKŁAD UŻYCIA
-# -----------------------------
+# =========================================================
+# 3. UCZENIE MASZYNOWE – DRZEWO DECYZYJNE
+# =========================================================
+
+def train_ml_model(train_df, test_df, parameters):
+    X_train = train_df[parameters]
+    y_train = train_df["Disease"]
+
+    X_test = test_df[parameters]
+    y_test = test_df["Disease"]
+
+    model = DecisionTreeClassifier(
+        max_depth=6,
+        random_state=42
+    )
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    print("\n=== UCZENIE MASZYNOWE (TEST) ===")
+    print("Accuracy:", accuracy_score(y_test, y_pred))
+    print(classification_report(y_test, y_pred))
+
+    return model
+
+
+# =========================================================
+# 4. MAIN – TRAIN / TEST DLA OBU SYSTEMÓW
+# =========================================================
+
 if __name__ == "__main__":
+
     data = pd.read_csv("Blood_samples.csv")
 
     parameters = [
-        "Glucose","Cholesterol","Hemoglobin","Platelets","White Blood Cells","Red Blood Cells",
-        "Hematocrit","Mean Corpuscular Volume","Mean Corpuscular Hemoglobin",
-        "Mean Corpuscular Hemoglobin Concentration","Insulin","BMI","Systolic Blood Pressure",
-        "Diastolic Blood Pressure","Triglycerides","HbA1c","LDL Cholesterol","HDL Cholesterol",
-        "ALT","AST","Heart Rate","Creatinine","Troponin","C-reactive Protein"
+        "Glucose","Cholesterol","Hemoglobin","Platelets","White Blood Cells",
+        "Red Blood Cells","Hematocrit","Mean Corpuscular Volume",
+        "Mean Corpuscular Hemoglobin",
+        "Mean Corpuscular Hemoglobin Concentration","Insulin","BMI",
+        "Systolic Blood Pressure","Diastolic Blood Pressure","Triglycerides",
+        "HbA1c","LDL Cholesterol","HDL Cholesterol","ALT","AST",
+        "Heart Rate","Creatinine","Troponin","C-reactive Protein"
     ]
 
-    # 1️⃣ przygotowanie systemu
-    thresholds = compute_thresholds(data, parameters)
-    discret_dataset = discretize_dataset(data, thresholds)
+    # -----------------------------
+    # PODZIAŁ TRAIN / TEST
+    # -----------------------------
+    train_df, test_df = train_test_split(
+        data,
+        test_size=0.2,
+        random_state=42,
+        stratify=data["Disease"]
+    )
 
-    rules_df = generate_association_rules(discret_dataset)
+    # =============================
+    # SYSTEM REGUŁOWY – TRAIN
+    # =============================
+    thresholds = compute_thresholds(train_df, parameters)
+    train_disc = discretize_dataset(train_df, thresholds)
+
+    rules_df = generate_association_rules(train_disc)
     expert_rules = rules_to_expert_format(rules_df, top_n=800)
 
-    # 2️⃣ test skuteczności
-    correct = 0
-    total = 0
-    no_prediction = 0
+    # =============================
+    # SYSTEM REGUŁOWY – TEST
+    # =============================
+    correct, total, no_pred = 0, 0, 0
 
-    for idx, row in data.iterrows():
-        true_disease = row["Disease"]
+    for _, row in test_df.iterrows():
+        true = row["Disease"]
+        disc = discretize_sample(row, thresholds)
+        disc.pop("Disease")
 
-        sample_disc = discretize_sample(row, thresholds)
-        sample_disc.pop("Disease")  # ❗ ukrywamy prawdziwą chorobę
+        pred = apply_rules(disc, expert_rules)
 
-        predicted = apply_rules(sample_disc, expert_rules, min_confidence=0.7)
-
-
-        if predicted is None:
-            no_prediction += 1
+        if pred is None:
+            no_pred += 1
             continue
 
-        if predicted == true_disease:
+        total += 1
+        if pred == true:
             correct += 1
 
-        total += 1
+    acc_rules = correct / total if total else 0
 
-    accuracy = correct / total if total > 0 else 0
+    print("\n=== SYSTEM REGUŁOWY (TEST) ===")
+    print("Accuracy:", acc_rules)
+    print("Brak reguły:", no_pred)
 
-    print("=== WYNIKI TESTU ===")
-    print(f"Liczba próbek: {len(data)}")
-    print(f"Przewidziane: {total}")
-    print(f"Brak reguły: {no_prediction}")
-    print(f"Poprawne: {correct}")
-    print(f"Accuracy: {accuracy:.2%}")
+    # =============================
+    # UCZENIE MASZYNOWE
+    # =============================
+    ml_model = train_ml_model(train_df, test_df, parameters)
 
+    # =============================
+    # PORÓWNANIE
+    # =============================
+    print("\n=== PORÓWNANIE KOŃCOWE ===")
+    print(f"Reguły IF–THEN Accuracy: {acc_rules:.2%}")
